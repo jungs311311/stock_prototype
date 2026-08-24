@@ -37,5 +37,11 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add seen.json
-          git diff --staged --quiet || git commit -m "공시 기록 갱신"
-          git push
+          git diff --staged --quiet && exit 0
+          git commit -m "공시 기록 갱신"
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && exit 0
+            sleep 5
+          done
+          echo "저장 실패"
+          exit 1
