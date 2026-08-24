@@ -1,0 +1,41 @@
+name: 공시 알림
+
+on:
+  # 평일 한국시간 09시~19시, 15분마다 확인 (cron은 UTC 기준)
+  schedule:
+    - cron: "*/15 0-10 * * 1-5"
+  # 버튼으로 직접 실행할 수 있게 하는 옵션
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 준비
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 필요한 것 설치
+        run: pip install requests
+
+      - name: 공시 확인하고 알림 보내기
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+        run: python dart_alert.py
+
+      - name: 보낸 기록 저장
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add seen.json
+          git diff --staged --quiet || git commit -m "공시 기록 갱신"
+          git push
