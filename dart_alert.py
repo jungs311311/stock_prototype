@@ -1,9 +1,10 @@
 """
-DART 공시 -> 텔레그램 알림 (v3)
+DART 공시 -> 텔레그램 알림 (v4)
 
-- 감시 종목은 watchlist.txt 에서 읽습니다
-- 종목코드로 정확히 매칭합니다
-- 손으로 직접 실행하면(Run workflow) 목록에 오타가 없는지 점검해서 알려줍니다
+- 감시 회사는 watchlist.txt 에서 이름으로 읽습니다
+- 기본은 이름이 정확히 일치하는 회사만 잡습니다
+- 이름 뒤에 * 을 붙이면 그 이름이 들어간 회사를 모두 잡습니다
+- 손으로 실행하면(Run workflow) 목록에 오타가 없는지 점검해서 알려줍니다
 """
 
 import os
@@ -21,7 +22,6 @@ TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 DART_KEY = os.environ["DART_API_KEY"]
 
-# 손으로 실행했는지, 예약 실행인지 구분
 MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 
 SEEN_FILE = Path("seen.json")
@@ -103,75 +103,78 @@ def send(text):
 
 
 def load_watchlist():
-    """watchlist.txt 를 읽어 종목코드 집합과 회사명 목록으로 나눕니다."""
-    codes, names = {}, []
+    """정확히 일치시킬 이름과, 부분 일치시킬 이름으로 나눕니다."""
+    exact, partial = set(), []
     if not WATCH_FILE.exists():
         print("watchlist.txt 가 없습니다")
-        return codes, names
+        return exact, partial
 
     for line in WATCH_FILE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split()
-        first = parts[0]
-        if first.isdigit() and len(first) == 6:
-            memo = " ".join(parts[1:]) if len(parts) > 1 else first
-            codes[first] = memo
+        # 혹시 따옴표나 쉼표를 붙여 적었어도 알아서 걷어냅니다
+        line = line.strip('",\'[] \t')
+        if not line:
+            continue
+        if line.endswith("*"):
+            partial.append(line[:-1].strip())
         else:
-            names.append(line)
+            exact.add(line)
 
-    return codes, names
+    return exact, partial
 
 
-def verify_watchlist(codes, names):
-    """DART 전체 회사 목록을 받아 오타를 점검합니다. 손으로 실행할 때만 돕니다."""
+def matches(corp_name, exact, partial):
+    if corp_name in exact:
+        return True
+    return any(p and p in corp_name for p in partial)
+
+
+def verify_watchlist(exact, partial):
+    """DART 전체 회사 명부와 대조해 오타를 잡아냅니다."""
     try:
         r = requests.get(
-            f"{BASE}/corpCode.xml",
-            params={"crtfc_key": DART_KEY},
-            timeout=120,
+            f"{BASE}/corpCode.xml", params={"crtfc_key": DART_KEY}, timeout=120
         )
         z = zipfile.ZipFile(io.BytesIO(r.content))
         root = ET.fromstring(z.read(z.namelist()[0]))
     except Exception as e:
-        print("회사 목록 내려받기 실패:", e)
+        print("회사 명부 내려받기 실패:", e)
+        send("⚠️ 회사 명부를 받지 못해 점검을 건너뜁니다.")
         return
 
-    listed = {}   # 종목코드 -> 회사명
-    all_names = []
-    for el in root.iter("list"):
-        name = (el.findtext("corp_name") or "").strip()
-        stock = (el.findtext("stock_code") or "").strip()
-        all_names.append(name)
-        if stock:
-            listed[stock] = name
+    all_names = [
+        (el.findtext("corp_name") or "").strip() for el in root.iter("list")
+    ]
+    name_set = set(all_names)
 
-    ok_lines, bad_lines = [], []
+    ok, bad = [], []
 
-    for code, memo in codes.items():
-        real = listed.get(code)
-        if real:
-            mark = "" if (memo == code or memo == real) else f"  (적어두신 이름: {memo})"
-            ok_lines.append(f"✔ {code} {real}{mark}")
+    for nm in sorted(exact):
+        if nm in name_set:
+            ok.append(f"✔ {nm}")
         else:
-            bad_lines.append(f"✘ {code} — 상장 종목코드에 없습니다")
+            near = [n for n in all_names if nm in n][:3]
+            hint = f" (혹시 {', '.join(near)}?)" if near else ""
+            bad.append(f"✘ {nm} — 이 이름의 회사가 없습니다{hint}")
 
-    for nm in names:
-        matched = [n for n in all_names if nm in n]
-        if not matched:
-            bad_lines.append(f"✘ {nm} — 이런 이름의 회사가 없습니다")
-        elif len(matched) > 5:
-            bad_lines.append(f"⚠ {nm} — {len(matched)}개 회사가 걸립니다. 너무 많이 옵니다")
+    for nm in partial:
+        found = [n for n in all_names if nm in n]
+        if not found:
+            bad.append(f"✘ {nm}* — 걸리는 회사가 없습니다")
+        elif len(found) > 8:
+            bad.append(f"⚠ {nm}* — {len(found)}곳이 걸립니다. 너무 많습니다")
         else:
-            ok_lines.append(f"✔ {nm} → {', '.join(matched)}")
+            ok.append(f"✔ {nm}* → {', '.join(found)}")
 
-    msg = f"🔎 <b>감시 목록 점검</b>\n\n정상 {len(ok_lines)}건"
-    if bad_lines:
-        msg += f" / 확인 필요 {len(bad_lines)}건\n\n" + "\n".join(bad_lines)
+    msg = f"🔎 <b>감시 목록 점검</b>\n\n정상 {len(ok)}곳"
+    if bad:
+        msg += f" / 확인 필요 {len(bad)}곳\n\n" + "\n".join(bad)
     else:
         msg += "\n\n전부 정상입니다."
-    msg += "\n\n" + "\n".join(ok_lines)
+    if ok:
+        msg += "\n\n" + "\n".join(ok)
     send(msg)
 
 
@@ -256,11 +259,11 @@ def format_detail(row):
 
 
 def main():
-    codes, names = load_watchlist()
-    print(f"감시 종목: 코드 {len(codes)}개, 이름 {len(names)}개")
+    exact, partial = load_watchlist()
+    print(f"감시 대상: 정확히 {len(exact)}곳, 부분일치 {len(partial)}건")
 
     if MANUAL:
-        verify_watchlist(codes, names)
+        verify_watchlist(exact, partial)
 
     first_run = not SEEN_FILE.exists()
     seen = set(json.loads(SEEN_FILE.read_text())) if not first_run else set()
@@ -268,19 +271,16 @@ def main():
     items = fetch_today()
     print(f"오늘 전체 공시 {len(items)}건")
 
-    hits = []
-    for it in items:
-        stock = (it.get("stock_code") or "").strip()
-        corp = it.get("corp_name", "")
-        if stock in codes or any(nm in corp for nm in names):
-            hits.append(it)
-
+    hits = [
+        it for it in items
+        if matches(it.get("corp_name", ""), exact, partial)
+    ]
     new = [it for it in hits if it["rcept_no"] not in seen]
 
     if first_run:
         for it in items:
             seen.add(it["rcept_no"])
-        send(f"✅ <b>알림 시작</b>\n오늘 전체 {len(items)}건 / 감시 종목 {len(hits)}건")
+        send(f"✅ <b>알림 시작</b>\n오늘 전체 {len(items)}건 / 감시 대상 {len(hits)}건")
         SEEN_FILE.write_text(json.dumps(sorted(seen)[-3000:], ensure_ascii=False))
         return
 
