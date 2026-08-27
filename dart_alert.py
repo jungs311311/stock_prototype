@@ -1,10 +1,5 @@
 """
-DART 공시 -> 텔레그램 알림 (v4)
-
-- 감시 회사는 watchlist.txt 에서 이름으로 읽습니다
-- 기본은 이름이 정확히 일치하는 회사만 잡습니다
-- 이름 뒤에 * 을 붙이면 그 이름이 들어간 회사를 모두 잡습니다
-- 손으로 실행하면(Run workflow) 목록에 오타가 없는지 점검해서 알려줍니다
+DART 공시 -> 텔레그램 알림 (v5)
 """
 
 import os
@@ -84,6 +79,16 @@ LABELS = {
 
 SKIP = {"rcept_no", "corp_cls", "corp_code", "corp_name", "status", "message"}
 
+# 제목에 이 단어가 있으면 알림을 보내지 않습니다
+IGNORE = [
+    "특정증권등소유상황보고서",
+    "대량보유상황보고서",
+    "기업설명회",
+    "대규모기업집단현황공시",
+    "분기보고서",
+    "반기보고서",
+]
+
 
 def send(text):
     if len(text) > 3900:
@@ -103,7 +108,6 @@ def send(text):
 
 
 def load_watchlist():
-    """정확히 일치시킬 이름과, 부분 일치시킬 이름으로 나눕니다."""
     exact, partial = set(), []
     if not WATCH_FILE.exists():
         print("watchlist.txt 가 없습니다")
@@ -113,7 +117,6 @@ def load_watchlist():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # 혹시 따옴표나 쉼표를 붙여 적었어도 알아서 걷어냅니다
         line = line.strip('",\'[] \t')
         if not line:
             continue
@@ -132,7 +135,6 @@ def matches(corp_name, exact, partial):
 
 
 def verify_watchlist(exact, partial):
-    """DART 전체 회사 명부와 대조해 오타를 잡아냅니다."""
     try:
         r = requests.get(
             f"{BASE}/corpCode.xml", params={"crtfc_key": DART_KEY}, timeout=120
@@ -274,6 +276,7 @@ def main():
     hits = [
         it for it in items
         if matches(it.get("corp_name", ""), exact, partial)
+        and not any(w in it.get("report_nm", "") for w in IGNORE)
     ]
     new = [it for it in hits if it["rcept_no"] not in seen]
 
