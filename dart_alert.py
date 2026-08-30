@@ -1,11 +1,13 @@
 """
-DART 공시 -> 텔레그램 알림 (v5)
+DART 공시 -> 텔레그램 알림 (v6)
+- DART 서버가 느릴 때 3번까지 재시도하고, 그래도 안 되면 조용히 건너뜁니다
 """
 
 import os
 import io
 import json
 import html
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
@@ -93,18 +95,21 @@ IGNORE = [
 def send(text):
     if len(text) > 3900:
         text = text[:3900] + "\n\n(내용이 길어 잘렸습니다)"
-    r = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=15,
-    )
-    if r.status_code != 200:
-        print("텔레그램 전송 실패:", r.text)
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            print("텔레그램 전송 실패:", r.text)
+    except Exception as e:
+        print("텔레그램 접속 실패:", e)
 
 
 def load_watchlist():
@@ -134,16 +139,30 @@ def matches(corp_name, exact, partial):
     return any(p and p in corp_name for p in partial)
 
 
+def dart_get(path, params, tries=3):
+    """DART 호출. 실패하면 잠시 쉬었다 다시 시도합니다."""
+    params = dict(params, crtfc_key=DART_KEY)
+    for attempt in range(tries):
+        try:
+            return requests.get(f"{BASE}/{path}", params=params, timeout=30)
+        except Exception as e:
+            print(f"  DART 접속 실패 ({attempt + 1}/{tries}):", e)
+            if attempt < tries - 1:
+                time.sleep(10)
+    return None
+
+
 def verify_watchlist(exact, partial):
+    r = dart_get("corpCode.xml", {}, tries=2)
+    if r is None:
+        send("⚠️ 회사 명부를 받지 못해 점검을 건너뜁니다.")
+        return
     try:
-        r = requests.get(
-            f"{BASE}/corpCode.xml", params={"crtfc_key": DART_KEY}, timeout=120
-        )
         z = zipfile.ZipFile(io.BytesIO(r.content))
         root = ET.fromstring(z.read(z.namelist()[0]))
     except Exception as e:
-        print("회사 명부 내려받기 실패:", e)
-        send("⚠️ 회사 명부를 받지 못해 점검을 건너뜁니다.")
+        print("회사 명부 해석 실패:", e)
+        send("⚠️ 회사 명부를 읽지 못해 점검을 건너뜁니다.")
         return
 
     all_names = [
@@ -181,24 +200,31 @@ def verify_watchlist(exact, partial):
 
 
 def fetch_today():
+    """오늘 공시 목록. 서버에 못 붙으면 None 을 돌려줍니다."""
     today = datetime.now(KST).strftime("%Y%m%d")
     items, page = [], 1
 
     while page <= 30:
-        r = requests.get(
-            f"{BASE}/list.json",
-            params={
-                "crtfc_key": DART_KEY,
+        r = dart_get(
+            "list.json",
+            {
                 "bgn_de": today,
                 "end_de": today,
                 "page_no": page,
                 "page_count": 100,
             },
-            timeout=20,
         )
-        data = r.json()
-        status = data.get("status")
+        if r is None:
+            print("DART 서버에 연결하지 못했습니다. 이번 회차는 건너뜁니다.")
+            return None
 
+        try:
+            data = r.json()
+        except Exception as e:
+            print("DART 응답 해석 실패:", e)
+            return None
+
+        status = data.get("status")
         if status == "013":
             break
         if status != "000":
@@ -222,20 +248,18 @@ def pick_endpoint(report_nm):
 
 def fetch_detail(endpoint, corp_code, rcept_no):
     today = datetime.now(KST).strftime("%Y%m%d")
+    r = dart_get(
+        f"{endpoint}.json",
+        {"corp_code": corp_code, "bgn_de": today, "end_de": today},
+        tries=2,
+    )
+    if r is None:
+        return None
+
     try:
-        r = requests.get(
-            f"{BASE}/{endpoint}.json",
-            params={
-                "crtfc_key": DART_KEY,
-                "corp_code": corp_code,
-                "bgn_de": today,
-                "end_de": today,
-            },
-            timeout=20,
-        )
         data = r.json()
     except Exception as e:
-        print(f"  상세 조회 실패 ({endpoint}):", e)
+        print(f"  상세 응답 해석 실패 ({endpoint}):", e)
         return None
 
     if data.get("status") != "000":
@@ -265,47 +289,3 @@ def main():
     print(f"감시 대상: 정확히 {len(exact)}곳, 부분일치 {len(partial)}건")
 
     if MANUAL:
-        verify_watchlist(exact, partial)
-
-    first_run = not SEEN_FILE.exists()
-    seen = set(json.loads(SEEN_FILE.read_text())) if not first_run else set()
-
-    items = fetch_today()
-    print(f"오늘 전체 공시 {len(items)}건")
-
-    hits = [
-        it for it in items
-        if matches(it.get("corp_name", ""), exact, partial)
-        and not any(w in it.get("report_nm", "") for w in IGNORE)
-    ]
-    new = [it for it in hits if it["rcept_no"] not in seen]
-
-    if first_run:
-        for it in items:
-            seen.add(it["rcept_no"])
-        send(f"✅ <b>알림 시작</b>\n오늘 전체 {len(items)}건 / 감시 대상 {len(hits)}건")
-        SEEN_FILE.write_text(json.dumps(sorted(seen)[-3000:], ensure_ascii=False))
-        return
-
-    for it in new:
-        corp = html.escape(it.get("corp_name", ""))
-        title = html.escape(it.get("report_nm", ""))
-        link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={it['rcept_no']}"
-        print(f"처리 중: {corp} - {title}")
-
-        detail_text = ""
-        endpoint = pick_endpoint(it.get("report_nm", ""))
-        if endpoint:
-            row = fetch_detail(endpoint, it["corp_code"], it["rcept_no"])
-            if row:
-                detail_text = "\n\n" + format_detail(row)
-
-        send(f"📢 <b>{corp}</b>\n{title}{detail_text}\n\n{link}")
-        seen.add(it["rcept_no"])
-
-    print(f"새 공시 {len(new)}건 발송")
-    SEEN_FILE.write_text(json.dumps(sorted(seen)[-3000:], ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()
