@@ -289,3 +289,50 @@ def main():
     print(f"감시 대상: 정확히 {len(exact)}곳, 부분일치 {len(partial)}건")
 
     if MANUAL:
+        verify_watchlist(exact, partial)
+
+    first_run = not SEEN_FILE.exists()
+    seen = set(json.loads(SEEN_FILE.read_text())) if not first_run else set()
+
+    items = fetch_today()
+    if items is None:
+        return
+
+    print(f"오늘 전체 공시 {len(items)}건")
+
+    hits = [
+        it for it in items
+        if matches(it.get("corp_name", ""), exact, partial)
+        and not any(w in it.get("report_nm", "") for w in IGNORE)
+    ]
+    new = [it for it in hits if it["rcept_no"] not in seen]
+
+    if first_run:
+        for it in items:
+            seen.add(it["rcept_no"])
+        send(f"✅ <b>알림 시작</b>\n오늘 전체 {len(items)}건 / 감시 대상 {len(hits)}건")
+        SEEN_FILE.write_text(json.dumps(sorted(seen)[-3000:], ensure_ascii=False))
+        return
+
+    for it in new:
+        corp = html.escape(it.get("corp_name", ""))
+        title = html.escape(it.get("report_nm", ""))
+        link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={it['rcept_no']}"
+        print(f"처리 중: {corp} - {title}")
+
+        detail_text = ""
+        endpoint = pick_endpoint(it.get("report_nm", ""))
+        if endpoint:
+            row = fetch_detail(endpoint, it["corp_code"], it["rcept_no"])
+            if row:
+                detail_text = "\n\n" + format_detail(row)
+
+        send(f"📢 <b>{corp}</b>\n{title}{detail_text}\n\n{link}")
+        seen.add(it["rcept_no"])
+
+    print(f"새 공시 {len(new)}건 발송")
+    SEEN_FILE.write_text(json.dumps(sorted(seen)[-3000:], ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
