@@ -1,17 +1,17 @@
 """
-DART 공시 -> 텔레그램 알림 (v7)
+DART 공시 -> 텔레그램 알림 (v8)
 - 항목별 데이터가 있으면 그걸로
-- 없으면 공시 본문 텍스트를 뽑아서 보여줍니다
+- 없으면 공시 원문의 표를 읽어 '항목: 값' 형태로 정리해 보여줍니다
 """
 
 import os
 import io
-import re
 import json
 import html
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -28,7 +28,8 @@ WATCH_FILE = Path("watchlist.txt")
 KST = timezone(timedelta(hours=9))
 BASE = "https://opendart.fss.or.kr/api"
 
-BODY_CHARS = 1200          # 본문에서 보여줄 최대 글자수
+MAX_LINES = 22        # 본문에서 보여줄 최대 줄 수
+MAX_CHARS = 1400      # 본문 전체 최대 글자수
 
 DETAIL_MAP = [
     ("자기주식취득 신탁계약 해지", "tsstkAqTrctrCcDecsn"),
@@ -70,6 +71,12 @@ LABELS = {
     "aq_pp": "취득 목적",
     "aq_mth": "취득 방법",
     "cs_iv_bk": "위탁 증권사",
+    "aq_dd": "취득 결정일",
+    "aq_wtn_div_ostk": "배당가능이익 내 취득 보통주식수",
+    "aq_wtn_div_ostk_rt": "배당가능이익 내 취득 비율(%)",
+    "eaq_ostk": "기타취득 보통주식수",
+    "eaq_ostk_rt": "기타취득 비율(%)",
+    "d1_prodlm_ostk": "1일 매수주문 한도",
     "bd_tm": "회차",
     "bd_knd": "사채 종류",
     "bd_fta": "사채 총액",
@@ -83,9 +90,9 @@ LABELS = {
     "bddd": "이사회 결의일",
 }
 
-SKIP = {"rcept_no", "corp_cls", "corp_code", "corp_name", "status", "message"}
+SKIP = {"rcept_no", "corp_cls", "corp_code", "corp_name", "status", "message",
+        "od_a_at_t", "od_a_at_b", "adt_a_atn"}
 
-# 아예 알림을 보내지 않을 공시
 IGNORE = [
     "특정증권등소유상황보고서",
     "대량보유상황보고서",
@@ -95,14 +102,20 @@ IGNORE = [
     "반기보고서",
 ]
 
-# 문서가 너무 커서 본문을 안 가져올 공시 (제목만 보냅니다)
 BODY_SKIP = [
     "투자설명서",
     "증권신고서",
     "사업보고서",
     "감사보고서",
-    "설명서",
     "일괄신고",
+]
+
+# 본문에서 빼버릴 잡줄
+NOISE = [
+    "소관사항입니다",
+    "전자공시시스템",
+    "dart.fss.or.kr",
+    "관련공시",
 ]
 
 
@@ -278,28 +291,70 @@ def format_detail(row):
         if key in SKIP or value in (None, "", "-"):
             continue
         lines.append(f"· {LABELS.get(key, key)}: {html.escape(str(value))}")
-        if len(lines) >= 18:
+        if len(lines) >= 20:
             lines.append("· ...")
             break
     return "\n".join(lines)
 
 
+def tidy(s):
+    return " ".join(s.split())
+
+
+class DartDoc(HTMLParser):
+    """공시 원문에서 표의 칸과 일반 문장을 따로 뽑아냅니다."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self.row = None
+        self.cell = None
+        self.loose = []
+        self.mute = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.mute += 1
+        elif tag == "tr":
+            self.row = []
+        elif tag in ("td", "th"):
+            self.cell = []
+        elif tag == "br" and self.cell is not None:
+            self.cell.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.mute = max(0, self.mute - 1)
+        elif tag in ("td", "th") and self.cell is not None:
+            if self.row is not None:
+                self.row.append(tidy("".join(self.cell)))
+            self.cell = None
+        elif tag == "tr":
+            if self.row:
+                self.rows.append(self.row)
+            self.row = None
+
+    def handle_data(self, data):
+        if self.mute:
+            return
+        if self.cell is not None:
+            self.cell.append(data)
+        elif self.row is None:
+            t = tidy(data)
+            if t:
+                self.loose.append(t)
+
+
 def fetch_body(rcept_no):
-    """공시 원문에서 글자만 뽑아옵니다."""
+    """원문을 받아 표를 '항목: 값' 형태로 정리합니다."""
     r = dart_get("document.xml", {"rcept_no": rcept_no}, tries=2, timeout=60)
     if r is None:
         return ""
     try:
         z = zipfile.ZipFile(io.BytesIO(r.content))
+        raw = z.read(z.namelist()[0])
     except Exception as e:
         print("  본문 압축 해제 실패:", e)
-        return ""
-
-    raw = b""
-    for name in z.namelist():
-        raw = z.read(name)
-        break
-    if not raw:
         return ""
 
     text = ""
@@ -312,16 +367,48 @@ def fetch_body(rcept_no):
     if not text:
         return ""
 
-    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html.unescape(text)
-    text = re.sub(r"[ \t\xa0]+", " ", text)
-    text = re.sub(r"\s*\n\s*", "\n", text)
-    text = re.sub(r"\n{2,}", "\n", text).strip()
+    parser = DartDoc()
+    try:
+        parser.feed(text)
+    except Exception as e:
+        print("  본문 해석 실패:", e)
+        return ""
 
-    if len(text) > BODY_CHARS:
-        text = text[:BODY_CHARS] + " ..."
-    return text
+    lines, seen = [], set()
+
+    def push(s):
+        s = tidy(s)
+        if not s or s in ("-", "—"):
+            return
+        if any(n in s for n in NOISE):
+            return
+        if s in seen:
+            return
+        seen.add(s)
+        lines.append(s)
+
+    for cells in parser.rows:
+        cells = [c for c in cells if c and c not in ("-", "—")]
+        if not cells:
+            continue
+        if len(cells) == 1:
+            push(cells[0])
+        else:
+            label = " ".join(cells[:-1])
+            push(f"{label} : {cells[-1]}")
+        if len(lines) >= MAX_LINES:
+            break
+
+    if not lines:
+        for t in parser.loose:
+            push(t)
+            if len(lines) >= MAX_LINES:
+                break
+
+    out = "\n".join(f"· {l}" for l in lines[:MAX_LINES])
+    if len(out) > MAX_CHARS:
+        out = out[:MAX_CHARS] + " ..."
+    return out
 
 
 def main():
