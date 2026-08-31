@@ -1,10 +1,12 @@
 """
-DART 공시 -> 텔레그램 알림 (v6)
-- DART 서버가 느릴 때 3번까지 재시도하고, 그래도 안 되면 조용히 건너뜁니다
+DART 공시 -> 텔레그램 알림 (v7)
+- 항목별 데이터가 있으면 그걸로
+- 없으면 공시 본문 텍스트를 뽑아서 보여줍니다
 """
 
 import os
 import io
+import re
 import json
 import html
 import time
@@ -25,6 +27,8 @@ SEEN_FILE = Path("seen.json")
 WATCH_FILE = Path("watchlist.txt")
 KST = timezone(timedelta(hours=9))
 BASE = "https://opendart.fss.or.kr/api"
+
+BODY_CHARS = 1200          # 본문에서 보여줄 최대 글자수
 
 DETAIL_MAP = [
     ("자기주식취득 신탁계약 해지", "tsstkAqTrctrCcDecsn"),
@@ -81,7 +85,7 @@ LABELS = {
 
 SKIP = {"rcept_no", "corp_cls", "corp_code", "corp_name", "status", "message"}
 
-# 제목에 이 단어가 있으면 알림을 보내지 않습니다
+# 아예 알림을 보내지 않을 공시
 IGNORE = [
     "특정증권등소유상황보고서",
     "대량보유상황보고서",
@@ -89,6 +93,16 @@ IGNORE = [
     "대규모기업집단현황공시",
     "분기보고서",
     "반기보고서",
+]
+
+# 문서가 너무 커서 본문을 안 가져올 공시 (제목만 보냅니다)
+BODY_SKIP = [
+    "투자설명서",
+    "증권신고서",
+    "사업보고서",
+    "감사보고서",
+    "설명서",
+    "일괄신고",
 ]
 
 
@@ -139,12 +153,11 @@ def matches(corp_name, exact, partial):
     return any(p and p in corp_name for p in partial)
 
 
-def dart_get(path, params, tries=3):
-    """DART 호출. 실패하면 잠시 쉬었다 다시 시도합니다."""
+def dart_get(path, params, tries=3, timeout=30):
     params = dict(params, crtfc_key=DART_KEY)
     for attempt in range(tries):
         try:
-            return requests.get(f"{BASE}/{path}", params=params, timeout=30)
+            return requests.get(f"{BASE}/{path}", params=params, timeout=timeout)
         except Exception as e:
             print(f"  DART 접속 실패 ({attempt + 1}/{tries}):", e)
             if attempt < tries - 1:
@@ -153,7 +166,7 @@ def dart_get(path, params, tries=3):
 
 
 def verify_watchlist(exact, partial):
-    r = dart_get("corpCode.xml", {}, tries=2)
+    r = dart_get("corpCode.xml", {}, tries=2, timeout=120)
     if r is None:
         send("⚠️ 회사 명부를 받지 못해 점검을 건너뜁니다.")
         return
@@ -165,13 +178,10 @@ def verify_watchlist(exact, partial):
         send("⚠️ 회사 명부를 읽지 못해 점검을 건너뜁니다.")
         return
 
-    all_names = [
-        (el.findtext("corp_name") or "").strip() for el in root.iter("list")
-    ]
+    all_names = [(el.findtext("corp_name") or "").strip() for el in root.iter("list")]
     name_set = set(all_names)
 
     ok, bad = [], []
-
     for nm in sorted(exact):
         if nm in name_set:
             ok.append(f"✔ {nm}")
@@ -200,24 +210,17 @@ def verify_watchlist(exact, partial):
 
 
 def fetch_today():
-    """오늘 공시 목록. 서버에 못 붙으면 None 을 돌려줍니다."""
     today = datetime.now(KST).strftime("%Y%m%d")
     items, page = [], 1
 
     while page <= 30:
         r = dart_get(
             "list.json",
-            {
-                "bgn_de": today,
-                "end_de": today,
-                "page_no": page,
-                "page_count": 100,
-            },
+            {"bgn_de": today, "end_de": today, "page_no": page, "page_count": 100},
         )
         if r is None:
             print("DART 서버에 연결하지 못했습니다. 이번 회차는 건너뜁니다.")
             return None
-
         try:
             data = r.json()
         except Exception as e:
@@ -255,17 +258,14 @@ def fetch_detail(endpoint, corp_code, rcept_no):
     )
     if r is None:
         return None
-
     try:
         data = r.json()
     except Exception as e:
         print(f"  상세 응답 해석 실패 ({endpoint}):", e)
         return None
-
     if data.get("status") != "000":
         print(f"  상세 없음 ({endpoint}):", data.get("status"), data.get("message"))
         return None
-
     for row in data.get("list", []):
         if row.get("rcept_no") == rcept_no:
             return row
@@ -282,6 +282,46 @@ def format_detail(row):
             lines.append("· ...")
             break
     return "\n".join(lines)
+
+
+def fetch_body(rcept_no):
+    """공시 원문에서 글자만 뽑아옵니다."""
+    r = dart_get("document.xml", {"rcept_no": rcept_no}, tries=2, timeout=60)
+    if r is None:
+        return ""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+    except Exception as e:
+        print("  본문 압축 해제 실패:", e)
+        return ""
+
+    raw = b""
+    for name in z.namelist():
+        raw = z.read(name)
+        break
+    if not raw:
+        return ""
+
+    text = ""
+    for enc in ("utf-8", "cp949", "euc-kr"):
+        try:
+            text = raw.decode(enc)
+            break
+        except Exception:
+            continue
+    if not text:
+        return ""
+
+    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t\xa0]+", " ", text)
+    text = re.sub(r"\s*\n\s*", "\n", text)
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+
+    if len(text) > BODY_CHARS:
+        text = text[:BODY_CHARS] + " ..."
+    return text
 
 
 def main():
@@ -316,18 +356,24 @@ def main():
 
     for it in new:
         corp = html.escape(it.get("corp_name", ""))
-        title = html.escape(it.get("report_nm", ""))
+        report = it.get("report_nm", "")
+        title = html.escape(report)
         link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={it['rcept_no']}"
-        print(f"처리 중: {corp} - {title}")
+        print(f"처리 중: {corp} - {report}")
 
-        detail_text = ""
-        endpoint = pick_endpoint(it.get("report_nm", ""))
+        body = ""
+        endpoint = pick_endpoint(report)
         if endpoint:
             row = fetch_detail(endpoint, it["corp_code"], it["rcept_no"])
             if row:
-                detail_text = "\n\n" + format_detail(row)
+                body = "\n\n" + format_detail(row)
 
-        send(f"📢 <b>{corp}</b>\n{title}{detail_text}\n\n{link}")
+        if not body and not any(w in report for w in BODY_SKIP):
+            raw = fetch_body(it["rcept_no"])
+            if raw:
+                body = "\n\n" + html.escape(raw)
+
+        send(f"📢 <b>{corp}</b>\n{title}{body}\n\n{link}")
         seen.add(it["rcept_no"])
 
     print(f"새 공시 {len(new)}건 발송")
